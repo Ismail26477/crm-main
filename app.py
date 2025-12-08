@@ -4,6 +4,7 @@ import uuid
 import traceback
 from datetime import datetime, timedelta
 from functools import wraps
+import threading
 
 from flask import Flask, request, jsonify, render_template, send_from_directory, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -130,8 +131,8 @@ def send_email(recipient_email, subject, html_body, caller_name=""):
         msg.attach(part)
         
         # Send email
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
+            server.starttls(timeout=10)
             server.login(sender_email, sender_password)
             server.sendmail(sender_email, recipient_email, msg.as_string())
         
@@ -142,6 +143,79 @@ def send_email(recipient_email, subject, html_body, caller_name=""):
         print(f"[v0] Email Error: {str(e)}")
         app.logger.error(f"Error sending email to {recipient_email}: {str(e)}")
         return False
+
+def send_new_lead_notification_async(lead_id, lead_data):
+    """Send email notification asynchronously (in background thread)"""
+    try:
+        send_new_lead_notification(lead_id, lead_data)
+    except Exception as e:
+        print(f"[v0] Async Email Error: {str(e)}")
+        app.logger.error(f"Error in async notification: {str(e)}")
+
+def send_new_lead_notification(lead_id, lead_data):
+    """Send email notification to assigned caller about new lead"""
+    try:
+        db = get_mongo_db()
+        lead = db.leads.find_one({"id": lead_id}) if not lead_data else lead_data
+        
+        if not lead:
+            print(f"[v0] Lead not found: {lead_id}")
+            return False
+        
+        assigned_caller_id = lead.get('assignedCaller')
+        if not assigned_caller_id:
+            print(f"[v0] No caller assigned to lead {lead_id}")
+            return False
+        
+        # Get caller details
+        from bson import ObjectId
+        try:
+            oid = ObjectId(assigned_caller_id)
+            caller = db.callers.find_one({"_id": oid})
+        except:
+            caller = None
+        
+        if not caller:
+            print(f"[v0] Caller not found: {assigned_caller_id}")
+            return False
+        
+        caller_email = caller.get('email')
+        if not caller_email or not caller_email.strip():
+            print(f"[v0] Caller {caller.get('username')} has no email configured")
+            return False
+        
+        # Create email
+        caller_name = caller.get('name') or caller.get('username', 'Caller')
+        email_body = create_lead_assignment_email(
+            caller_name=caller_name,
+            lead_name=lead.get('name', 'Unknown'),
+            lead_phone=lead.get('phone', ''),
+            lead_email=lead.get('email', ''),
+            lead_value=lead.get('value', 0),
+            lead_source=lead.get('source', ''),
+            lead_city=lead.get('city', '')
+        )
+        
+        # Send email
+        email_sent = send_email(
+            recipient_email=caller_email,
+            subject=f"New Lead Assigned: {lead.get('name', 'Unknown')}",
+            html_body=email_body,
+            caller_name=caller_name
+        )
+        
+        if email_sent:
+            print(f"[v0] New lead notification sent to {caller_email}")
+            app.logger.info(f"New lead notification email sent to {caller_email}")
+        else:
+            print(f"[v0] Failed to send email to {caller_email}")
+        
+        return email_sent
+    except Exception as e:
+        print(f"[v0] Error sending new lead notification: {str(e)}")
+        app.logger.error(f"Error sending new lead notification: {str(e)}")
+        return False
+
 
 def create_lead_assignment_email(caller_name, lead_name, lead_phone, lead_email, lead_value, lead_source, lead_city):
     """Create HTML email for lead assignment notification"""
@@ -218,50 +292,6 @@ def create_lead_assignment_email(caller_name, lead_name, lead_phone, lead_email,
     
     return html_body
 
-def send_new_lead_notification(lead_id, lead_data):
-    """Send email notification to assigned caller about new lead"""
-    try:
-        db = get_mongo_db()
-        lead = db.leads.find_one({"id": lead_id}) if not lead_data else lead_data
-        
-        if not lead:
-            print(f"[v0] Lead not found: {lead_id}")
-            return False
-        
-        assigned_caller_id = lead.get('assignedCaller')
-        if not assigned_caller_id:
-            print(f"[v0] No caller assigned to lead {lead_id}")
-            return False
-        
-        # Get caller details
-        from bson import ObjectId
-        try:
-            oid = ObjectId(assigned_caller_id)
-            caller = db.callers.find_one({"_id": oid})
-        except:
-            caller = None
-        
-        if not caller:
-            print(f"[v0] Caller not found: {assigned_caller_id}")
-            return False
-        
-        caller_email = caller.get('email')
-        if not caller_email or not caller_email.strip():
-            print(f"[v0] Caller {caller.get('username')} has no email configured")
-            return False
-        
-        # Create email
-        caller_name = caller.get('name') or caller.get('username', 'Caller')
-        email_body = create_lead_assignment_email(
-            caller_name=caller_name,
-            lead_name=lead.get('name', 'Unknown'),
-            lead_phone=lead.get('phone', ''),
-            lead_email=lead.get('email', ''),
-            lead_value=lead.get('value', 0),
-            lead_source=lead.get('source', ''),
-            lead_city=lead.get('city', '')
-        )
-        
         # Send email
         email_sent = send_email(
             recipient_email=caller_email,
@@ -880,7 +910,7 @@ def create_lead():
                 doc['assignedCaller'] = str(caller.get('_id'))
                 doc['assignedCallerName'] = caller.get("username", "")
                 doc['assignedAt'] = datetime.utcnow()
-                send_new_lead_notification(doc_id, doc)
+                send_new_lead_notification_async(doc_id, doc) # Use async version
 
         return jsonify({"success": True, "lead": {"id": doc_id}}), 201
     except pymongo.errors.DuplicateKeyError:
@@ -1186,9 +1216,14 @@ def import_leads():
                 
                 imported_count += 1
                 
-                # Send email notification if assigned
                 if assigned_caller:
-                    send_new_lead_notification(lead_id, doc)
+                    # Start email notification in a background thread
+                    notification_thread = threading.Thread(
+                        target=send_new_lead_notification_async,
+                        args=(lead_id, doc),
+                        daemon=True
+                    )
+                    notification_thread.start()
                 
             except Exception as e:
                 app.logger.error(f"Error importing lead: {str(e)}")
