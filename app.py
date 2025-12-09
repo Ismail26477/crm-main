@@ -113,8 +113,11 @@ def send_email(recipient_email, subject, html_body, caller_name=""):
         sender_email = os.environ.get('SENDER_EMAIL', get_settings('sender_email', ''))
         sender_password = os.environ.get('SENDER_PASSWORD', get_settings('sender_password', ''))
         
+        print(f"[v0] Email Debug - SMTP Server: {smtp_server}, Port: {smtp_port}, From: {sender_email}, To: {recipient_email}")
+        
         if not smtp_server or not sender_email or not sender_password:
-            app.logger.debug(f"Email not sent: SMTP configuration incomplete")
+            print(f"[v0] Email Config Missing - Server: {bool(smtp_server)}, Email: {bool(sender_email)}, Password: {bool(sender_password)}")
+            app.logger.warning(f"Email not sent: SMTP configuration incomplete")
             return False
         
         # Create message
@@ -127,29 +130,19 @@ def send_email(recipient_email, subject, html_body, caller_name=""):
         part = MIMEText(html_body, "html")
         msg.attach(part)
         
-        # Send email with retry logic
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
-                    server.starttls(timeout=10)
-                    server.login(sender_email, sender_password)
-                    server.sendmail(sender_email, recipient_email, msg.as_string())
-                
-                app.logger.info(f"Email sent to {recipient_email} - {subject}")
-                return True
-            except (OSError, smtplib.SMTPException) as e:
-                if attempt < max_retries - 1:
-                    import time
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                    continue
-                raise
-    except OSError as e:
-        app.logger.debug(f"Email network error (expected on Render.com): {str(e)}")
-        return True  # Don't block lead creation
+        # Send email
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as server:
+            server.starttls(timeout=10)
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, recipient_email, msg.as_string())
+        
+        print(f"[v0] Email Successfully Sent to {recipient_email}")
+        app.logger.info(f"Email sent to {recipient_email} - {subject}")
+        return True
     except Exception as e:
-        app.logger.warning(f"Email sending skipped for {recipient_email}: {str(e)}")
-        return True  # Return True to not block the lead creation/update
+        print(f"[v0] Email Error: {str(e)}")
+        app.logger.error(f"Error sending email to {recipient_email}: {str(e)}")
+        return False
 
 def send_new_lead_notification_async(lead_id, lead_data):
     """Send email notification asynchronously (in background thread)"""
@@ -177,12 +170,10 @@ def send_new_lead_notification(lead_id, lead_data):
         # Get caller details
         from bson import ObjectId
         try:
-            # Attempt to find caller by ObjectId first
             oid = ObjectId(assigned_caller_id)
             caller = db.callers.find_one({"_id": oid})
         except:
-            # If not ObjectId, assume it's a username and try to find by username
-            caller = db.callers.find_one({"username": assigned_caller_id})
+            caller = None
         
         if not caller:
             print(f"[v0] Caller not found: {assigned_caller_id}")
@@ -1762,55 +1753,56 @@ def assign_lead_to_caller(lead_id):
         caller_name = caller.get('name') or caller.get('username', 'Caller')
         
         if caller_email and caller_email.strip():
-            # Send in background thread to avoid timeout
-            notification_thread = threading.Thread(
-                target=lambda: send_email_notification_for_assignment(
-                    caller_email=caller_email,
-                    caller_name=caller_name,
-                    lead=lead
-                ),
-                daemon=True
+            email_body = create_lead_assignment_email(
+                caller_name=caller_name,
+                lead_name=lead.get('name', 'Unknown'),
+                lead_phone=lead.get('phone', ''),
+                lead_email=lead.get('email', ''),
+                lead_value=lead.get('value', 0),
+                lead_source=lead.get('source', ''),
+                lead_city=lead.get('city', '')
             )
-            notification_thread.start()
+            
+            email_sent = send_email(
+                recipient_email=caller_email,
+                subject=f"New Lead Assigned: {lead.get('name', 'Unknown')}",
+                html_body=email_body,
+                caller_name=caller_name
+            )
+            
+            if email_sent:
+                app.logger.info(f"Assignment notification email sent to {caller_email}")
+        else:
+            app.logger.warning(f"Caller {caller.get('username')} has no email address configured")
 
         # Create activity log
         activity_doc = {
             "lead_id": lead_id,
             "activityType": "assigned",
-            "message": f"Lead assigned to {caller.get('username', 'Unknown')}",
-            "performedBy": session.get('username'),
-            "timestamp": datetime.utcnow(),
-            "leadSnapshot": lead
+            "description": f"Assigned to {caller.get('username', '')}",
+            "performedBy": session.get('caller_id'),
+            "performedByName": session.get('user'),
+            "createdAt": datetime.utcnow()
         }
+
         db.activities.insert_one(activity_doc)
 
-        return jsonify({"success": True, "message": "Lead assigned successfully"})
+        # Create audit log
+        audit_doc = {
+            "action": "lead_assigned",
+            "performedBy": session.get('user'),
+            "target": lead_id,
+            "details": f"Lead assigned to {caller.get('username', '')}",
+            "timestamp": datetime.utcnow()
+        }
 
+        db.audit_logs.insert_one(audit_doc)
+
+        return jsonify({"success": True, "message": "Lead assigned successfully"})
     except Exception as e:
-        app.logger.error(f"Error assigning lead: {str(e)}")
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
-def send_email_notification_for_assignment(caller_email, caller_name, lead):
-    """Send assignment notification email in background (no timeout blocking)"""
-    try:
-        email_body = create_lead_assignment_email(
-            caller_name=caller_name,
-            lead_name=lead.get('name', 'Unknown'),
-            lead_phone=lead.get('phone', ''),
-            lead_email=lead.get('email', ''),
-            lead_value=lead.get('value', 0),
-            lead_source=lead.get('source', ''),
-            lead_city=lead.get('city', '')
-        )
-        
-        send_email(
-            recipient_email=caller_email,
-            subject=f"New Lead Assigned: {lead.get('name', 'Unknown')}",
-            html_body=email_body,
-            caller_name=caller_name
-        )
-    except Exception as e:
-        app.logger.debug(f"Background email send for assignment failed (expected on Render): {str(e)}")
 
 # -----------------------
 # Get audit logs (admin only)
