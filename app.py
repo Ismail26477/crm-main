@@ -114,7 +114,7 @@ def send_email(recipient_email, subject, html_body, caller_name=""):
         sender_password = os.environ.get('SENDER_PASSWORD', get_settings('sender_password', ''))
         
         if not smtp_server or not sender_email or not sender_password:
-            app.logger.warning(f"Email not sent: SMTP configuration incomplete")
+            app.logger.debug(f"Email not sent: SMTP configuration incomplete")
             return False
         
         # Create message
@@ -144,11 +144,12 @@ def send_email(recipient_email, subject, html_body, caller_name=""):
                     time.sleep(2 ** attempt)  # Exponential backoff
                     continue
                 raise
+    except OSError as e:
+        app.logger.debug(f"Email network error (expected on Render.com): {str(e)}")
+        return True  # Don't block lead creation
     except Exception as e:
-        app.logger.error(f"Error sending email to {recipient_email}: {str(e)}")
-        print(f"[v0] Email Notification Skipped (Network Issue): {recipient_email}")
-        # Return True to not block the lead creation/update
-        return True
+        app.logger.warning(f"Email sending skipped for {recipient_email}: {str(e)}")
+        return True  # Return True to not block the lead creation/update
 
 def send_new_lead_notification_async(lead_id, lead_data):
     """Send email notification asynchronously (in background thread)"""
@@ -157,102 +158,6 @@ def send_new_lead_notification_async(lead_id, lead_data):
     except Exception as e:
         print(f"[v0] Async Email Error: {str(e)}")
         app.logger.error(f"Error in async notification: {str(e)}")
-
-def send_new_lead_notification(lead_id, lead_data):
-    """Send email notifications when a new lead is created"""
-    try:
-        email_notifications_enabled = get_settings('email_notifications_enabled', True)
-        
-        if not email_notifications_enabled:
-            return
-        
-        lead_name = lead_data.get('leadName', 'New Lead')
-        lead_number = lead_data.get('leadNumber', 'N/A')
-        assigned_caller = lead_data.get('assignedCaller', '')
-        lead_category = lead_data.get('leadCategory', '')
-        lead_stage = lead_data.get('leadStage', 'New Lead')
-        
-        # Get admin email
-        admin_email = get_settings('admin_email', '')
-        
-        # HTML Email Template
-        html_body = f"""
-        <html>
-            <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
-                <div style="max-width: 600px; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                    <h2 style="color: #333; margin-top: 0;">New Lead Created</h2>
-                    <p style="color: #666; line-height: 1.6;">
-                        A new lead has been created in your CRM system.
-                    </p>
-                    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-                        <tr style="background-color: #f9f9f9;">
-                            <td style="padding: 12px; border: 1px solid #ddd; font-weight: bold;">Lead Name:</td>
-                            <td style="padding: 12px; border: 1px solid #ddd;">{lead_name}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 12px; border: 1px solid #ddd; font-weight: bold;">Lead Number:</td>
-                            <td style="padding: 12px; border: 1px solid #ddd;">{lead_number}</td>
-                        </tr>
-                        <tr style="background-color: #f9f9f9;">
-                            <td style="padding: 12px; border: 1px solid #ddd; font-weight: bold;">Category:</td>
-                            <td style="padding: 12px; border: 1px solid #ddd;">{lead_category}</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 12px; border: 1px solid #ddd; font-weight: bold;">Stage:</td>
-                            <td style="padding: 12px; border: 1px solid #ddd;">{lead_stage}</td>
-                        </tr>
-                        <tr style="background-color: #f9f9f9;">
-                            <td style="padding: 12px; border: 1px solid #ddd; font-weight: bold;">Assigned to:</td>
-                            <td style="padding: 12px; border: 1px solid #ddd;">{assigned_caller or 'Unassigned'}</td>
-                        </tr>
-                    </table>
-                    <p style="color: #999; font-size: 12px; margin-top: 20px;">
-                        This is an automated notification from your CRM system.
-                    </p>
-                </div>
-            </body>
-        </html>
-        """
-        
-        # Send to admin
-        if admin_email:
-            email_sent = send_email(
-                admin_email, 
-                f"New Lead Created: {lead_name}",
-                html_body,
-                caller_name=assigned_caller
-            )
-        
-        if assigned_caller:
-            try:
-                # Get caller's email from settings or database
-                # The original code did not have a direct way to get caller email from lead_data.
-                # We'll need to fetch it from the DB using the caller's username or ID if available in lead_data.
-                # For now, assuming lead_data structure needs to be updated or we can fetch caller details here.
-                # Let's assume `assignedCaller` is an ObjectId or username we can use to find the caller.
-                # For simplicity, we'll assume assigned_caller is a username and try to find it.
-                # A more robust solution would be to pass the caller's email directly or their ID.
-                
-                # Attempt to find the caller document from the DB
-                db_conn = get_mongo_db() # Ensure we have a db connection
-                caller_doc = db_conn.callers.find_one({"username": assigned_caller}) # Or {"_id": ObjectId(assigned_caller)} if it's an ID
-                
-                caller_email = None
-                if caller_doc:
-                    caller_email = caller_doc.get('email', '')
-                    
-                if caller_email and caller_email.strip():
-                    send_email(
-                        caller_email,
-                        f"New Lead Assigned to You: {lead_name}",
-                        html_body,
-                        caller_name=assigned_caller
-                    )
-            except Exception as e:
-                app.logger.error(f"Error sending email to assigned caller ({assigned_caller}): {str(e)}")
-    
-    except Exception as e:
-        app.logger.error(f"Error in send_new_lead_notification: {str(e)}")
 
 def send_new_lead_notification(lead_id, lead_data):
     """Send email notification to assigned caller about new lead"""
@@ -1857,56 +1762,55 @@ def assign_lead_to_caller(lead_id):
         caller_name = caller.get('name') or caller.get('username', 'Caller')
         
         if caller_email and caller_email.strip():
-            email_body = create_lead_assignment_email(
-                caller_name=caller_name,
-                lead_name=lead.get('name', 'Unknown'),
-                lead_phone=lead.get('phone', ''),
-                lead_email=lead.get('email', ''),
-                lead_value=lead.get('value', 0),
-                lead_source=lead.get('source', ''),
-                lead_city=lead.get('city', '')
+            # Send in background thread to avoid timeout
+            notification_thread = threading.Thread(
+                target=lambda: send_email_notification_for_assignment(
+                    caller_email=caller_email,
+                    caller_name=caller_name,
+                    lead=lead
+                ),
+                daemon=True
             )
-            
-            email_sent = send_email(
-                recipient_email=caller_email,
-                subject=f"New Lead Assigned: {lead.get('name', 'Unknown')}",
-                html_body=email_body,
-                caller_name=caller_name
-            )
-            
-            if email_sent:
-                app.logger.info(f"Assignment notification email sent to {caller_email}")
-        else:
-            app.logger.warning(f"Caller {caller.get('username')} has no email address configured")
+            notification_thread.start()
 
         # Create activity log
         activity_doc = {
             "lead_id": lead_id,
             "activityType": "assigned",
-            "description": f"Assigned to {caller.get('username', '')}",
-            "performedBy": session.get('caller_id'),
-            "performedByName": session.get('user'),
-            "createdAt": datetime.utcnow()
+            "message": f"Lead assigned to {caller.get('username', 'Unknown')}",
+            "performedBy": session.get('username'),
+            "timestamp": datetime.utcnow(),
+            "leadSnapshot": lead
         }
-
         db.activities.insert_one(activity_doc)
 
-        # Create audit log
-        audit_doc = {
-            "action": "lead_assigned",
-            "performedBy": session.get('user'),
-            "target": lead_id,
-            "details": f"Lead assigned to {caller.get('username', '')}",
-            "timestamp": datetime.utcnow()
-        }
-
-        db.audit_logs.insert_one(audit_doc)
-
         return jsonify({"success": True, "message": "Lead assigned successfully"})
+
     except Exception as e:
-        traceback.print_exc()
+        app.logger.error(f"Error assigning lead: {str(e)}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+def send_email_notification_for_assignment(caller_email, caller_name, lead):
+    """Send assignment notification email in background (no timeout blocking)"""
+    try:
+        email_body = create_lead_assignment_email(
+            caller_name=caller_name,
+            lead_name=lead.get('name', 'Unknown'),
+            lead_phone=lead.get('phone', ''),
+            lead_email=lead.get('email', ''),
+            lead_value=lead.get('value', 0),
+            lead_source=lead.get('source', ''),
+            lead_city=lead.get('city', '')
+        )
+        
+        send_email(
+            recipient_email=caller_email,
+            subject=f"New Lead Assigned: {lead.get('name', 'Unknown')}",
+            html_body=email_body,
+            caller_name=caller_name
+        )
+    except Exception as e:
+        app.logger.debug(f"Background email send for assignment failed (expected on Render): {str(e)}")
 
 # -----------------------
 # Get audit logs (admin only)
